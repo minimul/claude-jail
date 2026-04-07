@@ -1,0 +1,289 @@
+#!/bin/bash
+set -eo pipefail
+
+IMAGE_NAME="claude-jail"
+DIND_IMAGE="docker:27-dind"
+DIND_PORT=2375
+HOST_PWD="$(pwd)"
+_DIR_HASH="$(echo "$HOST_PWD" | md5sum | cut -c1-12)"
+DIND_CONTAINER_NAME="claude-jail-dind-${_DIR_HASH}"
+DIND_NETWORK_NAME="claude-jail-net-${_DIR_HASH}"
+SCRIPT_PATH="$(readlink -f "$0")"
+FORCE_REBUILD=false
+NO_CACHE=false
+SHELL_MODE=false
+RESUME_SESSION=""
+CONTINUE_SESSION=false
+SAFE_PERMISSIONS=false
+PASSTHROUGH_ARGS=()
+ENV_VARS=()
+: "${USER:=$(id -un)}"
+
+# ============================================
+# Custom apt packages to install (space-separated)
+# Modify this line to add your own packages
+CUSTOM_APT_PACKAGES="jq"
+# ============================================
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --rebuild|-r)
+            FORCE_REBUILD=true
+            shift
+            ;;
+        --no-cache)
+            NO_CACHE=true
+            shift
+            ;;
+        --shell|-s)
+            SHELL_MODE=true
+            shift
+            ;;
+        --resume|-R)
+            RESUME_SESSION="$2"
+            shift 2
+            ;;
+        --continue|-c)
+            CONTINUE_SESSION=true
+            shift
+            ;;
+        --safe)
+            SAFE_PERMISSIONS=true
+            shift
+            ;;
+        -e|--env)
+            if [ -z "${2:-}" ]; then
+                echo "Error: $1 requires a VALUE (e.g. -e KEY=VALUE)" >&2
+                exit 1
+            fi
+            ENV_VARS+=("$2")
+            shift 2
+            ;;
+        --help|-h)
+            echo "Usage: $0 [OPTIONS] [-- ARGS...]"
+            echo ""
+            echo "Options:"
+            echo "  -e,  --env KEY=VAL   Pass an environment variable to the container (repeatable)"
+            echo "  -r,  --rebuild       Force rebuild of the Docker image"
+            echo "       --no-cache      Rebuild without using Docker cache"
+            echo "  -s,  --shell         Start a bash shell instead of claude"
+            echo "  -R,  --resume UID    Resume a previous session by its ID"
+            echo "  -c,  --continue      Continue the most recent session"
+            echo "       --safe          Do NOT pass --dangerously-skip-permissions to claude"
+            echo "  -h,  --help          Show this help message"
+            echo ""
+            echo "Arguments after -- are passed through to claude."
+            exit 0
+            ;;
+        --)
+            shift
+            PASSTHROUGH_ARGS+=("$@")
+            break
+            ;;
+        *)
+            echo "Error: Unknown option '$1'" >&2
+            echo "Run '$0 --help' for usage." >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Create claude-home data directories
+claude_data="$HOME/.claude-home"
+mkdir -p "$claude_data/.claude"
+touch "$claude_data/.claude.json"
+
+# Compute hash of this script to detect changes
+SCRIPT_HASH=$(md5sum "$SCRIPT_PATH" | cut -d' ' -f1)
+
+# Check if rebuild is needed
+NEEDS_BUILD=false
+if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
+    echo "Image '$IMAGE_NAME' not found. Building..."
+    NEEDS_BUILD=true
+elif [ "$FORCE_REBUILD" = true ] || [ "$NO_CACHE" = true ]; then
+    echo "Forcing rebuild of '$IMAGE_NAME'..."
+    NEEDS_BUILD=true
+else
+    # Check if script has changed since last build
+    STORED_HASH=$(docker image inspect "$IMAGE_NAME" --format '{{index .Config.Labels "script.hash"}}' 2>/dev/null)
+    if [ "$SCRIPT_HASH" != "$STORED_HASH" ]; then
+        echo "Script changed since last build. Rebuilding '$IMAGE_NAME'..."
+        NEEDS_BUILD=true
+    fi
+fi
+
+if [ "$NEEDS_BUILD" = true ]; then
+    BUILD_ARGS=(
+      --build-arg "CUSTOM_APT_PACKAGES=$CUSTOM_APT_PACKAGES"
+      --label "script.hash=$SCRIPT_HASH"
+      -t "$IMAGE_NAME"
+    )
+    if [ "$NO_CACHE" = true ]; then
+        BUILD_ARGS+=(--no-cache)
+    fi
+    docker build "${BUILD_ARGS[@]}" - <<'DOCKERFILE'
+FROM node:22-bookworm
+
+ARG CUSTOM_APT_PACKAGES
+
+# Install system dependencies, Docker CLI, and custom packages
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg build-essential \
+    && if [ -n "$CUSTOM_APT_PACKAGES" ]; then \
+        apt-get install -y --no-install-recommends $CUSTOM_APT_PACKAGES; \
+    fi \
+    && install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
+    && chmod a+r /etc/apt/keyrings/docker.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable" > /etc/apt/sources.list.d/docker.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Claude Code globally (available to all users)
+RUN npm install -g @anthropic-ai/claude-code
+
+WORKDIR /workspace
+CMD ["claude"]
+DOCKERFILE
+fi
+
+# ---------------------------------------------------------------------------
+# Docker-in-Docker (DinD): the claude container gets its own completely
+# isolated Docker daemon.  It cannot see host containers, cannot mount the
+# host filesystem, and cannot access the host Docker socket.  The DinD
+# sidecar runs as a separate container and the claude container connects
+# to it over TCP via DOCKER_HOST on a dedicated private network.
+# DinD resources are scoped per launch directory via a directory hash so
+# concurrent sessions in different directories are fully isolated.
+# The host launch directory is volume-mounted into the DinD sidecar so that
+# docker-compose services inside DinD can bind-mount project files correctly.
+# ---------------------------------------------------------------------------
+
+# Ensure the dedicated bridge network exists (isolated from the default bridge)
+ensure_dind_network() {
+    if ! docker network inspect "$DIND_NETWORK_NAME" &>/dev/null; then
+        echo "Creating isolated network '$DIND_NETWORK_NAME'..."
+        docker network create --driver bridge "$DIND_NETWORK_NAME" >/dev/null
+    fi
+}
+
+ensure_dind() {
+    ensure_dind_network
+
+    # If the DinD container is already running, just return its IP on the private network
+    if docker inspect --format '{{.State.Running}}' "$DIND_CONTAINER_NAME" 2>/dev/null | grep -q true; then
+        DIND_IP=$(docker inspect --format "{{(index .NetworkSettings.Networks \"$DIND_NETWORK_NAME\").IPAddress}}" "$DIND_CONTAINER_NAME")
+        return
+    fi
+
+    # Remove stale stopped container if present
+    docker rm -f "$DIND_CONTAINER_NAME" &>/dev/null || true
+
+    echo "Starting Docker-in-Docker daemon ($DIND_CONTAINER_NAME)..."
+    docker run -d --name "$DIND_CONTAINER_NAME" \
+        --network "$DIND_NETWORK_NAME" \
+        --privileged \
+        -v "$HOST_PWD:$HOST_PWD" \
+        -e DOCKER_TLS_CERTDIR="" \
+        "$DIND_IMAGE" \
+        dockerd --host=tcp://0.0.0.0:${DIND_PORT} --tls=false >/dev/null
+
+    # Wait for the DinD daemon to be ready (up to 30s)
+    echo -n "Waiting for DinD daemon..."
+    DIND_IP=$(docker inspect --format "{{(index .NetworkSettings.Networks \"$DIND_NETWORK_NAME\").IPAddress}}" "$DIND_CONTAINER_NAME")
+    for i in $(seq 1 60); do
+        if docker exec "$DIND_CONTAINER_NAME" \
+               wget -qO- "http://127.0.0.1:${DIND_PORT}/_ping" &>/dev/null; then
+            echo " ready."
+            return
+        fi
+        echo -n "."
+        sleep 0.5
+    done
+
+    echo " FAILED"
+    echo "ERROR: DinD daemon did not become ready in time" >&2
+    docker logs "$DIND_CONTAINER_NAME" 2>&1 | tail -10 >&2
+    exit 1
+}
+
+# Stop and remove the DinD sidecar and network when the claude container exits
+cleanup_dind() {
+    echo "Stopping DinD sidecar..."
+    docker rm -f "$DIND_CONTAINER_NAME" &>/dev/null || true
+    docker network rm "$DIND_NETWORK_NAME" &>/dev/null || true
+}
+trap cleanup_dind EXIT
+
+ensure_dind
+
+if [ -z "$DIND_IP" ]; then
+    echo "ERROR: Could not determine DinD IP" >&2
+    exit 1
+fi
+
+# Build the docker run command.
+# - claude-home directories are mounted so Claude state persists across runs.
+# - HOME is set explicitly so claude resolves ~/.claude to the mounted
+#   /home/node/.claude directory.
+# - The host Docker socket is NEVER mounted.  DOCKER_HOST points to the
+#   isolated DinD daemon over TCP.
+# - The launch directory is mounted at its exact host path so that paths
+#   used by docker-compose volume mounts resolve correctly inside DinD.
+DOCKER_ARGS=(
+  -it --rm
+  --network "$DIND_NETWORK_NAME"
+  --cap-drop=ALL
+  --security-opt=no-new-privileges
+  --label "hostdir=$HOST_PWD"
+  -v "$HOST_PWD:$HOST_PWD"
+  -v "$claude_data/.claude:/home/node/.claude"
+  -v "$claude_data/.claude.json:/home/node/.claude.json"
+  -w "$HOST_PWD"
+  -e HOME=/home/node
+  -e DOCKER_HOST="tcp://${DIND_IP}:${DIND_PORT}"
+  -e CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1
+  -e CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+  -e DISABLE_AUTOUPDATER=1
+  -e IS_DEMO=1
+)
+
+# Append user-supplied environment variables
+for env_var in "${ENV_VARS[@]}"; do
+    DOCKER_ARGS+=(-e "$env_var")
+done
+
+# Build claude arguments from parsed options.
+# --dangerously-skip-permissions is passed by default (claude runs inside an
+# isolated container anyway); use --safe to opt out.
+CLAUDE_ARGS=()
+if [ "$SAFE_PERMISSIONS" != true ]; then
+    CLAUDE_ARGS+=(--dangerously-skip-permissions)
+fi
+if [ -n "$RESUME_SESSION" ]; then
+    CLAUDE_ARGS+=(--resume "$RESUME_SESSION")
+elif [ "$CONTINUE_SESSION" = true ]; then
+    CLAUDE_ARGS+=(--continue)
+fi
+
+# Run the container (no exec — let the EXIT trap fire for cleanup)
+set +e
+if [ "$SHELL_MODE" = true ]; then
+    EXISTING=$(docker ps -q --filter "label=hostdir=$HOST_PWD" --filter "ancestor=$IMAGE_NAME" | head -1)
+    if [ -n "$EXISTING" ]; then
+        # Attaching to an already-running container — don't tear down DinD on exit
+        trap - EXIT
+        exec docker exec -it "$EXISTING" bash
+    else
+        docker run "${DOCKER_ARGS[@]}" "$IMAGE_NAME" bash
+    fi
+elif [ ${#CLAUDE_ARGS[@]} -gt 0 ] || [ ${#PASSTHROUGH_ARGS[@]} -gt 0 ]; then
+    docker run "${DOCKER_ARGS[@]}" "$IMAGE_NAME" claude "${CLAUDE_ARGS[@]}" "${PASSTHROUGH_ARGS[@]}"
+else
+    docker run "${DOCKER_ARGS[@]}" "$IMAGE_NAME"
+fi
+exit $?
