@@ -1,5 +1,8 @@
 services:
-  # Simple web service that responds on port 8080
+  # Simple web service that responds on port 8080.
+  # claude-jail auto-attaches to this service's network when launched from
+  # the same directory, so `curl http://test-web:8080` works from inside
+  # the jail. See README.md "Testing compose-network access".
   test-web:
     image: alpine:3.19
     container_name: claude-test-web
@@ -11,41 +14,3 @@ services:
         while true; do
           echo -e 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK' | nc -l -p 8080
         done
-
-  # Test runner: checks volume mounts and compose service networking
-  docker-access-test:
-    image: alpine:3.19
-    container_name: claude-docker-access-test
-    depends_on:
-      - test-web
-    working_dir: /workspace
-    volumes:
-      - .:/workspace
-    command:
-      - sh
-      - -c
-      - |
-        echo '=== bldup-claude Docker Compose Test ==='
-        echo ''
-
-        echo '--- Test 1: Volume mount (project files visible) ---'
-        if [ -f /workspace/docker-compose.yml ]; then
-          echo '[PASS] docker-compose.yml found via volume mount'
-        else
-          echo '[FAIL] docker-compose.yml not found' && exit 1
-        fi
-        echo ''
-
-        echo '--- Test 2: Compose service networking ---'
-        ATTEMPT=1
-        while [ "$$ATTEMPT" -le 10 ]; do
-          BODY=$$(wget -qO- http://test-web:8080 2>/dev/null) && {
-            echo "[PASS] Got response from test-web: $$BODY"
-            exit 0
-          }
-          echo "  retry $$ATTEMPT..."
-          ATTEMPT=$$((ATTEMPT + 1))
-          sleep 1
-        done
-        echo '[FAIL] Could not reach test-web'
-        exit 1
