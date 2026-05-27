@@ -143,6 +143,31 @@ CUSTOM_APT_PACKAGES="jq git tmux sqlite3"
 
 Save the file and the image will rebuild automatically on the next run.
 
+### Ruby LSP (crimson)
+
+The image includes [crimson](https://github.com/seuros/crimson), a Ruby LSP server, pre-installed at `/home/node/.local/bin/crimson`. It is automatically registered as an MCP server in `~/.claude-home/.claude/settings.local.json` (mounted into the container as `/home/node/.claude/settings.local.json`) the first time `claude-jail` runs:
+
+```json
+{
+  "mcpServers": {
+    "crimson": {
+      "type": "stdio",
+      "command": "crimson",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+> **Temporary setup note:** crimson is a private binary that is not yet publicly distributed via an install script. Until it is, you must manually copy the `crimson` binary into the root of this project directory before building the image:
+>
+> ```bash
+> cp /path/to/crimson ./crimson
+> claude-jail --rebuild
+> ```
+>
+> The build will fail with a `COPY` error if the binary is absent from the project directory.
+
 ## Volume mounts
 
 | Host | Container | Mode | Purpose |
@@ -160,6 +185,7 @@ The image contains:
 - `docker-ce-cli` and `docker-compose-plugin` (the real binary lives at `/usr/local/libexec/docker-real`; the shim at `/usr/local/bin/docker` is what `$PATH` resolves to)
 - `curl`, `ca-certificates`, `gnupg`, `build-essential`
 - `jq` (via the default `CUSTOM_APT_PACKAGES`)
+- `crimson` Ruby LSP server (installed to `/home/node/.local/bin/crimson`)
 
 Add anything else you need via `CUSTOM_APT_PACKAGES`.
 

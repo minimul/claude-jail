@@ -116,6 +116,20 @@ done
 claude_data="$HOME/.claude-home"
 mkdir -p "$claude_data/.claude"
 touch "$claude_data/.claude.json"
+# Seed .claude/settings.local.json with crimson MCP server config if missing or empty
+if [ ! -s "$claude_data/.claude/settings.local.json" ]; then
+    cat > "$claude_data/.claude/settings.local.json" <<'LOCALJSON'
+{
+  "mcpServers": {
+    "crimson": {
+      "type": "stdio",
+      "command": "crimson",
+      "args": ["mcp"]
+    }
+  }
+}
+LOCALJSON
+fi
 
 # Compute hash of this script to detect changes
 SCRIPT_HASH=$(md5sum "$SCRIPT_PATH" | cut -d' ' -f1)
@@ -141,7 +155,7 @@ if [ "$NEEDS_BUILD" = true ]; then
     BUILD_DIR=$(mktemp -d)
     # Write Dockerfile
     cat > "$BUILD_DIR/Dockerfile" <<'DOCKERFILE'
-FROM node:22-bookworm
+FROM node:24-trixie
 
 ARG CUSTOM_APT_PACKAGES
 
@@ -157,7 +171,7 @@ RUN apt-get update \
     && curl -fsSL https://download.docker.com/linux/debian/gpg \
         | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
     && chmod a+r /etc/apt/keyrings/docker.gpg \
-    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable" \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian trixie stable" \
         > /etc/apt/sources.list.d/docker.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -174,8 +188,15 @@ RUN install -d /usr/local/libexec \
 COPY docker-shim /usr/local/bin/docker
 RUN chmod 0755 /usr/local/bin/docker
 
+# Install crimson Ruby LSP server for the node user
+COPY crimson /home/node/.local/bin/crimson
+RUN chmod 0755 /home/node/.local/bin/crimson \
+    && chown node:node /home/node/.local/bin/crimson
+
 # Install Claude Code globally (available to all users)
 RUN npm install -g @anthropic-ai/claude-code
+
+ENV PATH="/home/node/.local/bin:${PATH}"
 
 WORKDIR /workspace
 CMD ["claude"]
@@ -355,6 +376,9 @@ esac
 deny "'docker $CMD' is not recognized by the shim"
 SHIM
     chmod +x "$BUILD_DIR/docker-shim"
+
+    # Copy the crimson Ruby LSP binary into the build context
+    cp "$(dirname "$SCRIPT_PATH")/crimson" "$BUILD_DIR/crimson"
 
     BUILD_ARGS=(
       --build-arg "CUSTOM_APT_PACKAGES=$CUSTOM_APT_PACKAGES"
