@@ -90,6 +90,17 @@ while [[ $# -gt 0 ]]; do
             echo "  The shim is a soft fence (curl-to-socket bypasses it).  Do not"
             echo "  treat it as a sandbox primitive."
             echo ""
+            echo "Landlock filesystem confinement:"
+            echo "  The container command is prefixed with landlock-exec, which seals"
+            echo "  the claude process tree (and all descendants) so it can only write"
+            echo "  the workspace, ~/.claude, and /tmp, and can only read the rest of"
+            echo "  the rootfs.  It cannot overwrite the docker shim or any system file."
+            echo "  Control via the CLAUDE_JAIL_LANDLOCK env var (pass with -e):"
+            echo "    enforce  (default) apply rules; warn+run unconfined if the kernel"
+            echo "             lacks Landlock"
+            echo "    strict   abort if Landlock cannot be applied"
+            echo "    off      disable confinement"
+            echo ""
             echo "Compose network auto-attach:"
             echo "  If a docker compose project is currently running with its"
             echo "  working_dir equal to \$(pwd), claude-jail also attaches the jail"
@@ -188,6 +199,14 @@ RUN install -d /usr/local/libexec \
 COPY docker-shim /usr/local/bin/docker
 RUN chmod 0755 /usr/local/bin/docker
 
+# Compile the Landlock self-sandbox wrapper.  At runtime it seals the claude
+# process tree (and every descendant, un-droppably) to the workspace + agent
+# state + a read-only view of the rest of the rootfs, then exec's the real
+# command.  build-essential (installed above) provides gcc + linux headers.
+COPY landlock-exec.c /usr/local/src/landlock-exec.c
+RUN gcc -O2 -Wall -o /usr/local/bin/landlock-exec /usr/local/src/landlock-exec.c \
+    && chmod 0755 /usr/local/bin/landlock-exec
+
 # Install crimson Ruby LSP server for the node user
 COPY crimson /home/node/.local/bin/crimson
 RUN chmod 0755 /home/node/.local/bin/crimson \
@@ -199,7 +218,7 @@ RUN npm install -g @anthropic-ai/claude-code
 ENV PATH="/home/node/.local/bin:${PATH}"
 
 WORKDIR /workspace
-CMD ["claude"]
+CMD ["landlock-exec", "claude"]
 DOCKERFILE
 
     # Write the docker shim that will be COPY'd into /usr/local/bin/docker.
@@ -377,6 +396,220 @@ deny "'docker $CMD' is not recognized by the shim"
 SHIM
     chmod +x "$BUILD_DIR/docker-shim"
 
+    # Write the Landlock self-sandbox wrapper source.  Compiled in the
+    # Dockerfile to /usr/local/bin/landlock-exec and used as the container
+    # command prefix.  FILESYSTEM confinement only - no network rules, so the
+    # jail keeps full access to compose services on arbitrary ports.  The
+    # CLAUDE_JAIL_LANDLOCK env var selects enforce (default) / strict / off.
+    cat > "$BUILD_DIR/landlock-exec.c" <<'LLSRC'
+// claude-jail landlock-exec
+//
+// Self-sandboxing wrapper.  Installs a Landlock filesystem ruleset on the
+// calling process (which propagates, un-droppably, to every descendant) and
+// then execve()s the program named in argv[1..].  Used as the container
+// command prefix so the `claude` process tree can only touch the workspace,
+// the agent's own state, and a read-only view of the rest of the rootfs.
+//
+// FILESYSTEM ONLY.  No network rules are installed: claude-jail's headline
+// feature is reaching compose services by name on arbitrary ports, and
+// Landlock TCP rules are port-based, so confining them would cost that
+// ability for little gain.
+//
+// Behaviour knob (env CLAUDE_JAIL_LANDLOCK):
+//   unset / "enforce"  apply rules; if the kernel lacks Landlock, warn loudly
+//                      and exec UNCONFINED (keeps claude-jail portable)
+//   "strict"           any failure, including "kernel lacks Landlock", is fatal
+//   "off"              skip Landlock entirely and exec directly
+//
+// A setup error *after* Landlock is known to be supported (add_rule /
+// restrict_self failing) is ALWAYS fatal regardless of the knob -- that is a
+// real fault, not an absent feature, and we must never silently run unconfined.
+
+#define _GNU_SOURCE
+#include <linux/landlock.h>
+#include <sys/syscall.h>
+#include <sys/prctl.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <stdint.h>
+
+#ifndef __NR_landlock_create_ruleset
+#define __NR_landlock_create_ruleset 444
+#endif
+#ifndef __NR_landlock_add_rule
+#define __NR_landlock_add_rule 445
+#endif
+#ifndef __NR_landlock_restrict_self
+#define __NR_landlock_restrict_self 446
+#endif
+
+#define PROG "landlock-exec"
+
+static long ll_create_ruleset(const struct landlock_ruleset_attr *attr,
+                              size_t size, uint32_t flags) {
+    return syscall(__NR_landlock_create_ruleset, attr, size, flags);
+}
+static long ll_add_rule(int fd, enum landlock_rule_type t,
+                        const void *attr, uint32_t flags) {
+    return syscall(__NR_landlock_add_rule, fd, t, attr, flags);
+}
+static long ll_restrict_self(int fd, uint32_t flags) {
+    return syscall(__NR_landlock_restrict_self, fd, flags);
+}
+
+// All filesystem access rights, grouped.  We "handle" (i.e. deny-by-default)
+// the full set, then grant subsets per path.
+#define LL_READ ( \
+    LANDLOCK_ACCESS_FS_EXECUTE | \
+    LANDLOCK_ACCESS_FS_READ_FILE | \
+    LANDLOCK_ACCESS_FS_READ_DIR )
+
+#define LL_WRITE ( \
+    LANDLOCK_ACCESS_FS_WRITE_FILE | \
+    LANDLOCK_ACCESS_FS_REMOVE_DIR | \
+    LANDLOCK_ACCESS_FS_REMOVE_FILE | \
+    LANDLOCK_ACCESS_FS_MAKE_CHAR | \
+    LANDLOCK_ACCESS_FS_MAKE_DIR | \
+    LANDLOCK_ACCESS_FS_MAKE_REG | \
+    LANDLOCK_ACCESS_FS_MAKE_SOCK | \
+    LANDLOCK_ACCESS_FS_MAKE_FIFO | \
+    LANDLOCK_ACCESS_FS_MAKE_BLOCK | \
+    LANDLOCK_ACCESS_FS_MAKE_SYM | \
+    LANDLOCK_ACCESS_FS_REFER | \
+    LANDLOCK_ACCESS_FS_TRUNCATE )
+
+// Rights that are meaningful for a regular (non-directory) file.
+#define LL_FILE ( \
+    LANDLOCK_ACCESS_FS_EXECUTE | \
+    LANDLOCK_ACCESS_FS_READ_FILE | \
+    LANDLOCK_ACCESS_FS_WRITE_FILE | \
+    LANDLOCK_ACCESS_FS_TRUNCATE )
+
+static int g_strict = 0;
+
+static void fatal(const char *what) {
+    fprintf(stderr, PROG ": %s: %s\n", what, strerror(errno));
+    _exit(125);
+}
+
+// Grant `access` on `path`.  Missing paths (ENOENT) are skipped silently --
+// the allowlist is a superset covering several layouts.  Any *other* failure
+// is fatal: a half-applied ruleset must never fall through to an exec.
+static void grant(int ruleset_fd, const char *path, uint64_t access) {
+    int fd = open(path, O_PATH | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT)
+            return;
+        fprintf(stderr, PROG ": open %s: %s\n", path, strerror(errno));
+        _exit(125);
+    }
+    struct stat st;
+    if (fstat(fd, &st) == 0 && !S_ISDIR(st.st_mode))
+        access &= LL_FILE;   // directory-only rights are EINVAL on a file
+
+    struct landlock_path_beneath_attr pb = {
+        .allowed_access = access,
+        .parent_fd = fd,
+    };
+    if (ll_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, &pb, 0)) {
+        fprintf(stderr, PROG ": add_rule %s: %s\n", path, strerror(errno));
+        close(fd);
+        _exit(125);
+    }
+    close(fd);
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, PROG ": usage: " PROG " PROGRAM [ARGS...]\n");
+        return 125;
+    }
+
+    const char *mode = getenv("CLAUDE_JAIL_LANDLOCK");
+    if (mode && strcmp(mode, "off") == 0)
+        goto run;                       // explicit escape hatch
+    if (mode && strcmp(mode, "strict") == 0)
+        g_strict = 1;
+
+    // Probe Landlock and learn the kernel's max ABI so we only request rights
+    // the kernel understands.
+    long abi = ll_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION);
+    if (abi < 0) {
+        if (g_strict)
+            fatal("Landlock unavailable and CLAUDE_JAIL_LANDLOCK=strict");
+        fprintf(stderr, PROG ": WARNING: kernel has no usable Landlock "
+                        "(%s); running UNCONFINED\n", strerror(errno));
+        goto run;
+    }
+
+    uint64_t handled = LL_READ | LL_WRITE;
+    if (abi < 2) handled &= ~LANDLOCK_ACCESS_FS_REFER;
+    if (abi < 3) handled &= ~LANDLOCK_ACCESS_FS_TRUNCATE;
+
+    uint64_t rx  = LL_READ & handled;              // read + execute, no write
+    uint64_t rwx = (LL_READ | LL_WRITE) & handled; // full read/write/create + exec
+
+    struct landlock_ruleset_attr attr = { .handled_access_fs = handled };
+    int ruleset_fd = ll_create_ruleset(&attr, sizeof(attr), 0);
+    if (ruleset_fd < 0)
+        fatal("landlock_create_ruleset");
+
+    // Read-only + execute: the rest of the rootfs.  No write right is granted,
+    // so the agent cannot overwrite the docker shim, the claude binary, or any
+    // system file -- only read and execute them.
+    static const char *ro[] = {
+        "/usr", "/bin", "/sbin", "/lib", "/lib64", "/lib32", "/libx32",
+        "/opt", "/etc", NULL,
+    };
+    for (int i = 0; ro[i]; i++) grant(ruleset_fd, ro[i], rx);
+
+    // Read-only, no execute: kernel/pseudo filesystems tools introspect.
+    static const char *rd[] = { "/proc", "/sys", NULL };
+    for (int i = 0; rd[i]; i++)
+        grant(ruleset_fd, rd[i],
+              (LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR) & handled);
+
+    // Read/write/create + execute: workspace, agent state, scratch, devices,
+    // and the runtime dir (docker.sock lives here in the mounted-socket model).
+    // Execute is granted on /tmp and the home tree so npx/build caches and
+    // freshly compiled test binaries still run.
+    static const char *rw[] = {
+        "/home/node", "/tmp", "/var/tmp", "/dev", "/run", "/var/run", NULL,
+    };
+    for (int i = 0; rw[i]; i++) grant(ruleset_fd, rw[i], rwx);
+
+    // The workspace mount.  Prefer the explicit launcher-provided path; fall
+    // back to the current directory when run standalone.
+    const char *workdir = getenv("CLAUDE_JAIL_COMPOSE_WORKDIR");
+    if (workdir && workdir[0])
+        grant(ruleset_fd, workdir, rwx);
+    char cwd[4096];
+    if (getcwd(cwd, sizeof(cwd)))
+        grant(ruleset_fd, cwd, rwx);
+
+    // Belt-and-suspenders: name the known sub-mounts explicitly in case they
+    // sit on their own mount under /home/node.
+    grant(ruleset_fd, "/home/node/.claude", rwx);
+    grant(ruleset_fd, "/home/node/.claude.json", rwx);
+
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))
+        fatal("prctl(PR_SET_NO_NEW_PRIVS)");
+    if (ll_restrict_self(ruleset_fd, 0))
+        fatal("landlock_restrict_self");
+    close(ruleset_fd);
+
+run:
+    execvp(argv[1], &argv[1]);
+    fprintf(stderr, PROG ": exec %s: %s\n", argv[1], strerror(errno));
+    return 127;
+}
+LLSRC
+
     # Copy the crimson Ruby LSP binary into the build context
     cp "$(dirname "$SCRIPT_PATH")/crimson" "$BUILD_DIR/crimson"
 
@@ -497,7 +730,15 @@ build_scope_prompt() {
     printf '  - any operation against a container outside the allowlist above\n\n'
     printf 'If you need a host-wide operation, ask the user to run it on the host.\n'
     printf 'Do not try to bypass the shim by talking to /var/run/docker.sock\n'
-    printf 'directly with curl or a static binary.\n'
+    printf 'directly with curl or a static binary.\n\n'
+    printf '## Filesystem confinement (Landlock)\n\n'
+    printf 'Your process tree is sealed by Landlock.  You can read and execute the\n'
+    printf 'whole rootfs but can only WRITE to:\n'
+    printf '  - the workspace at %s\n' "$HOST_PWD"
+    printf '  - your state dir ~/.claude and ~/.claude.json\n'
+    printf '  - /tmp, /var/tmp, and your home cache dirs\n'
+    printf 'Writes elsewhere (e.g. /usr, /etc, the docker shim) fail with EACCES by\n'
+    printf 'design.  This is expected; do not try to work around it.\n'
 }
 
 SCOPE_PROMPT="$(build_scope_prompt)"
@@ -609,17 +850,22 @@ if [ "$SHELL_MODE" = true ]; then
     EXISTING=$(docker ps -q --filter "label=hostdir=$HOST_PWD" --filter "ancestor=$IMAGE_NAME" | head -1)
     if [ -n "$EXISTING" ]; then
         trap - EXIT
-        exec docker exec "${TTY_FLAGS[@]}" "$EXISTING" bash
+        # Wrap with landlock-exec so an exec'd debug shell is confined the same
+        # way the agent is.  Pass CLAUDE_JAIL_LANDLOCK=off via -e to opt out.
+        exec docker exec "${TTY_FLAGS[@]}" "$EXISTING" landlock-exec bash
     fi
 fi
 
 # Create the container (not yet running) so we can attach extra networks
 # before start.
 set +e
+# Every command is prefixed with landlock-exec so the process tree is sealed
+# to the workspace + agent state before the real program starts.  The bare
+# default branch relies on the image CMD (also landlock-exec claude).
 if [ "$SHELL_MODE" = true ]; then
-    JAIL_CID=$(docker create "${DOCKER_ARGS[@]}" "$IMAGE_NAME" bash)
+    JAIL_CID=$(docker create "${DOCKER_ARGS[@]}" "$IMAGE_NAME" landlock-exec bash)
 elif [ ${#CLAUDE_ARGS[@]} -gt 0 ] || [ ${#PASSTHROUGH_ARGS[@]} -gt 0 ]; then
-    JAIL_CID=$(docker create "${DOCKER_ARGS[@]}" "$IMAGE_NAME" claude "${CLAUDE_ARGS[@]}" "${PASSTHROUGH_ARGS[@]}")
+    JAIL_CID=$(docker create "${DOCKER_ARGS[@]}" "$IMAGE_NAME" landlock-exec claude "${CLAUDE_ARGS[@]}" "${PASSTHROUGH_ARGS[@]}")
 else
     JAIL_CID=$(docker create "${DOCKER_ARGS[@]}" "$IMAGE_NAME")
 fi
